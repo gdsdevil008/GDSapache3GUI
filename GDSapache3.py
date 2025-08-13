@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 GDSapache3 Final — updated to ask sudo password once at startup,
-and show Apache3 status with colored status bar.
+show Apache3 status with colored status bar,
+and enhanced Add Rule inputs with clear buttons.
 """
 
 import os
@@ -9,6 +10,7 @@ import subprocess
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
+import json
 
 # Try to use sv-ttk for modern dark theme, fall back if missing
 try:
@@ -20,6 +22,7 @@ except Exception:
 APP_TITLE = "GDS Apache3 Control Panel"
 rules = []
 SUDO_PW = None
+RULES_FILE = "gdsapache3_rules.json"
 
 # ---------------- sudo helpers ----------------
 def ask_sudo_password_startup():
@@ -113,11 +116,51 @@ def sudo_popen(cmd_list):
         pass
     return proc
 
+# ---------------- persistence ----------------
+def save_rules():
+    try:
+        rules_to_save = []
+        for r in rules:
+            # Exclude process objects, save only serializable info
+            rules_to_save.append({
+                "listen": r["listen"],
+                "host": r["host"],
+                "port": r["port"],
+                "active": r["active"],
+            })
+        with open(RULES_FILE, "w", encoding="utf-8") as f:
+            json.dump(rules_to_save, f, indent=2)
+        append_output("Rules saved to file.")
+    except Exception as e:
+        append_output(f"Failed to save rules: {e}")
+
+def load_rules():
+    global rules
+    if not os.path.isfile(RULES_FILE):
+        # Default initial rules
+        rules = [
+            {"listen": "80", "host": "127.0.0.1", "port": "80", "active": False, "proc": None},
+            {"listen": "8080", "host": "example.com", "port": "443", "active": False, "proc": None},
+            {"listen": "9000", "host": "localhost", "port": "22", "active": False, "proc": None},
+        ]
+        return
+    try:
+        with open(RULES_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+            rules = []
+            for r in loaded:
+                r["proc"] = None
+                rules.append(r)
+    except Exception as e:
+        append_output(f"Failed to load rules: {e}")
+        # Use empty rules on failure
+        rules = []
+
 # ---------------- core ----------------
 def add_rule():
-    listen = listen_port.get().strip()
-    host = target_host.get().strip()
-    port = target_port.get().strip()
+    listen = listen_port_var.get().strip()
+    host = target_host_var.get().strip()
+    port = target_port_var.get().strip()
     if not (listen and host and port):
         messagebox.showerror("Add Rule", "Please fill Listen Port, Target Host and Target Port.")
         return
@@ -129,6 +172,7 @@ def add_rule():
     refresh_table()
     status_var.set(f"Added rule: {listen} -> {host}:{port}")
     append_output(f"Added rule: {listen} -> {host}:{port}")
+    save_rules()
 
 def activate_rule(index):
     if index < 0 or index >= len(rules):
@@ -150,9 +194,22 @@ def activate_rule(index):
         refresh_table()
         status_var.set(f"Stopped forwarding {r['listen']}")
         append_output(f"Stopped forwarding {r['listen']} -> {r['host']}:{r['port']}")
+        save_rules()
         return
+    # Deactivate all others
     for o in rules:
         o["active"] = False
+        if o.get("proc"):
+            try:
+                o["proc"].terminate()
+                o["proc"].wait(timeout=1)
+            except Exception:
+                try:
+                    o["proc"].kill()
+                except Exception:
+                    pass
+            o["proc"] = None
+
     socat = which("socat")
     if socat:
         listen = r["listen"]; host = r["host"]; port = r["port"]
@@ -167,6 +224,7 @@ def activate_rule(index):
             refresh_table()
             status_var.set(f"Forwarding {listen} -> {host}:{port}")
             append_output(f"Started socat: {listen} -> {host}:{port}")
+            save_rules()
             return
         except Exception as e:
             append_output(f"socat start failed: {e}")
@@ -175,12 +233,15 @@ def activate_rule(index):
     refresh_table()
     status_var.set(f"Activated (no socat) {r['listen']}")
     append_output(f"Activated rule (no socat): {r['listen']} -> {r['host']}:{r['port']}")
+    save_rules()
 
 def remove_rule(index):
     if index < 0 or index >= len(rules):
         append_output(f"Remove failed: invalid index {index}")
         return
     r = rules[index]
+    if not messagebox.askyesno("Remove Rule", f"Remove rule {r['listen']} -> {r['host']}:{r['port']}?"):
+        return
     # Stop active forwarding process if running
     if r.get("active") and r.get("proc"):
         proc = r["proc"]
@@ -195,11 +256,11 @@ def remove_rule(index):
         r["proc"] = None
         r["active"] = False
         append_output(f"Stopped forwarding before removing rule {r['listen']}")
-    # Remove the rule
     removed = rules.pop(index)
     refresh_table()
     status_var.set(f"Removed rule: {removed['listen']} -> {removed['host']}:{removed['port']}")
     append_output(f"Removed rule: {removed['listen']} -> {removed['host']}:{removed['port']}")
+    save_rules()
 
 def open_rule(index):
     if index < 0 or index >= len(rules):
@@ -222,6 +283,7 @@ def refresh_table():
             r["listen"], r["host"], r["port"], status_text, act_text, "Open", "Remove"
         ))
 
+# ---------------- Apache Control ----------------
 def start_apache():
     rc, out, err = sudo_systemctl(["start", "apache2"])
     if rc is None:
@@ -251,7 +313,6 @@ def check_apache():
     if rc is None:
         return
     status = (out or err or "").strip().lower()
-
     if status == "active":
         status_var.set("Apache3 Status: Running")
         status_bar.config(bg="green", fg="white")
@@ -261,9 +322,9 @@ def check_apache():
     else:
         status_var.set(f"Apache3 Status: {status.capitalize()}")
         status_bar.config(bg="red", fg="white")
-
     append_output(out or err or f"Status check returned {rc}")
 
+# ---------------- Add HTML popup ----------------
 def add_html_popup():
     editor = tk.Toplevel(root)
     editor.title("Add HTML")
@@ -324,7 +385,7 @@ def add_html_popup():
     ttk.Button(btn_frame, text="Cancel", command=editor.destroy).pack(side="right", padx=4)
 
 # ---------------- UI ----------------
-ask_sudo_password_startup()  # <<< Ask sudo password before GUI
+ask_sudo_password_startup()  # Ask sudo password before GUI
 
 root = tk.Tk()
 root.title(APP_TITLE)
@@ -349,23 +410,46 @@ left_ctrl.pack(side="left", fill="both", expand=True, padx=(0,8))
 right_ctrl = ttk.Frame(controls_outer)
 right_ctrl.pack(side="right", fill="y")
 
-ttk.Label(left_ctrl, text="Listen Port:").grid(row=0, column=0, sticky="w", pady=2)
-listen_port = ttk.Combobox(left_ctrl, values=["80","443","8080","9000"], width=20)
-listen_port.set("80")
-listen_port.grid(row=0, column=1, sticky="w", padx=6, pady=2)
+# Variables for ComboBoxes
+listen_port_var = tk.StringVar(value="80")
+target_host_var = tk.StringVar(value="127.0.0.1")
+target_port_var = tk.StringVar(value="80")
 
-ttk.Label(left_ctrl, text="Target Host:").grid(row=1, column=0, sticky="w", pady=2)
-target_host = ttk.Combobox(left_ctrl, values=["127.0.0.1","192.168.1.10","localhost"], width=20)
-target_host.set("127.0.0.1")
-target_host.grid(row=1, column=1, sticky="w", padx=6, pady=2)
+# Clear functions for each input
+def clear_listen():
+    listen_port_var.set("")
 
-ttk.Label(left_ctrl, text="Target Port:").grid(row=2, column=0, sticky="w", pady=2)
-target_port = ttk.Combobox(left_ctrl, values=["80","443","8080","9000"], width=20)
-target_port.set("80")
-target_port.grid(row=2, column=1, sticky="w", padx=6, pady=2)
+def clear_host():
+    target_host_var.set("")
 
-ttk.Button(left_ctrl, text="Add Rule", command=add_rule).grid(row=3, column=0, columnspan=2, pady=(8,0))
+def clear_target_port():
+    target_port_var.set("")
 
+# Listen Port row
+ttk.Label(left_ctrl, text="Listen Port:").grid(row=0, column=0, sticky="w", pady=4)
+listen_combo = ttk.Combobox(left_ctrl, textvariable=listen_port_var, values=["80","443","8080","9000"], width=20)
+listen_combo.grid(row=0, column=1, sticky="w")
+btn_clear_listen = ttk.Button(left_ctrl, text="✕", width=2, command=clear_listen)
+btn_clear_listen.grid(row=0, column=2, padx=(4,10))
+
+# Target Host row
+ttk.Label(left_ctrl, text="Target Host:").grid(row=1, column=0, sticky="w", pady=4)
+host_combo = ttk.Combobox(left_ctrl, textvariable=target_host_var, values=["127.0.0.1","localhost","192.168.1.10"], width=20)
+host_combo.grid(row=1, column=1, sticky="w")
+btn_clear_host = ttk.Button(left_ctrl, text="✕", width=2, command=clear_host)
+btn_clear_host.grid(row=1, column=2, padx=(4,10))
+
+# Target Port row
+ttk.Label(left_ctrl, text="Target Port:").grid(row=2, column=0, sticky="w", pady=4)
+target_combo = ttk.Combobox(left_ctrl, textvariable=target_port_var, values=["80","443","8080","9000"], width=20)
+target_combo.grid(row=2, column=1, sticky="w")
+btn_clear_target = ttk.Button(left_ctrl, text="✕", width=2, command=clear_target_port)
+btn_clear_target.grid(row=2, column=2, padx=(4,10))
+
+# Add Rule button
+ttk.Button(left_ctrl, text="Add Rule", command=add_rule).grid(row=3, column=0, columnspan=3, pady=(8,0), sticky="ew")
+
+# Right side buttons for Apache control
 ttk.Button(right_ctrl, text="Start Apache3", command=start_apache).pack(fill="x", pady=4)
 ttk.Button(right_ctrl, text="Stop Apache3", command=stop_apache).pack(fill="x", pady=4)
 ttk.Button(right_ctrl, text="Check Apache3 Status", command=check_apache).pack(fill="x", pady=4)
@@ -374,7 +458,7 @@ ttk.Button(right_ctrl, text="Add HTML", command=add_html_popup).pack(fill="x", p
 cols = ("Listen","Target Host","Target Port","Status","Activate","Open","Remove")
 table_frame = ttk.Frame(root, padding=(8,8))
 table_frame.pack(fill="both", padx=12, pady=(0,6), expand=False)
-tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=3)
+tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=6)
 for c in cols:
     tree.heading(c, text=c)
     if c == "Target Host":
@@ -397,7 +481,6 @@ def on_table_click(event):
         index = int(item)
     except ValueError:
         index = tree.index(item)
-    # Sanity check for index bounds
     if index < 0 or index >= len(rules):
         append_output(f"Clicked invalid rule index: {index}")
         return
@@ -417,9 +500,7 @@ status_var = tk.StringVar(value="Status: No active forwarding")
 status_bar = tk.Label(root, textvariable=status_var, anchor="w", relief="sunken", bg="red", fg="white")
 status_bar.pack(fill="x", side="bottom")
 
-rules.append({"listen":"80","host":"127.0.0.1","port":"80","active":True,"proc":None})
-rules.append({"listen":"8080","host":"example.com","port":"443","active":False,"proc":None})
-rules.append({"listen":"9000","host":"localhost","port":"22","active":True,"proc":None})
+load_rules()
 refresh_table()
 
 root.mainloop()
